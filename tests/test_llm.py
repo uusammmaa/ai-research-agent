@@ -5,7 +5,13 @@ import pytest
 from agent.llm import REFUSAL_FALLBACK_BETA, LLMClient, is_retryable_llm_error
 from agent.reliability import RetryPolicy
 from agent.usage import RunUsage
-from evals.fakes import FakeAnthropic, api_status_error, overloaded_error, text_response
+from evals.fakes import (
+    FakeAnthropic,
+    FakeUsage,
+    api_status_error,
+    overloaded_error,
+    text_response,
+)
 from tests.conftest import by_name
 
 
@@ -135,3 +141,16 @@ async def test_records_usage_and_cost_on_span(spans):
     # 1000 * $4/M + 500 * $20/M
     assert span.attributes["llm.cost_usd"] == pytest.approx(0.014)
     assert usage.by_model["claude-opus-5-5"].calls == 1
+
+
+async def test_span_input_tokens_include_cached_tokens(spans):
+    llm, _ = client([text_response("done")])
+    llm._client.messages._script[0].usage = FakeUsage(200, 50, cache_read=3_000, cache_write=500)
+    usage = RunUsage()
+    await create(llm, usage)
+    (span,) = by_name(spans, "chat claude-opus-5-5")
+    # Semconv: input_tokens includes cached tokens, matching RunUsage totals.
+    assert span.attributes["gen_ai.usage.input_tokens"] == 3_700
+    assert span.attributes["gen_ai.usage.cache_read.input_tokens"] == 3_000
+    assert span.attributes["gen_ai.usage.cache_creation.input_tokens"] == 500
+    assert usage.input_tokens == 3_700

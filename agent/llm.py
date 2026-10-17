@@ -169,7 +169,12 @@ class LLMClient:
             span.set_attribute("gen_ai.response.finish_reasons", [str(response.stop_reason)])
             if usage is not None:
                 call = usage.record(served_by, getattr(response, "usage", None))
-                span.set_attribute("gen_ai.usage.input_tokens", call.input_tokens)
+                # GenAI semconv counts cached tokens inside input_tokens; the
+                # Anthropic API reports them separately, so add them back.
+                span.set_attribute(
+                    "gen_ai.usage.input_tokens",
+                    call.input_tokens + call.cache_read_tokens + call.cache_write_tokens,
+                )
                 span.set_attribute("gen_ai.usage.output_tokens", call.output_tokens)
                 span.set_attribute("gen_ai.usage.cache_read.input_tokens", call.cache_read_tokens)
                 span.set_attribute(
