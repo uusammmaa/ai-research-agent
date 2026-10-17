@@ -8,18 +8,19 @@ each edge case called out in the project's own troubleshooting table:
 JSON parsing (clean / fenced / prose-wrapped / malformed / missing field),
 max_iterations enforcement, unexpected stop_reason, and tool-error recovery.
 """
+
 import asyncio
 import json
 from unittest.mock import patch
 
 from agent import orchestrator
 from evals.fakes import (
+    VALID_BRIEF,
     FakeResponse,
-    text_response,
-    tool_use_response,
     make_create_stub,
     make_execute_tool_stub,
-    VALID_BRIEF,
+    text_response,
+    tool_use_response,
 )
 from evals.scoring import is_valid_research_brief
 
@@ -73,21 +74,34 @@ def _score_success_case(steps: dict, name: str) -> dict:
 
     tool_calls = _find(steps, "tool_call")
     checks["first_tool_is_fetch_url"] = (
-        bool(tool_calls) and tool_calls[0]["tool"] == "fetch_url"
-    ) if tool_calls else True  # no tools called is not a grounding violation by itself
+        (bool(tool_calls) and tool_calls[0]["tool"] == "fetch_url") if tool_calls else True
+    )  # no tools called is not a grounding violation by itself
 
     passed = all(checks.values())
-    return {"name": name, "expected": "complete", "passed": passed, "checks": checks, "steps": len(steps)}
+    return {
+        "name": name,
+        "expected": "complete",
+        "passed": passed,
+        "checks": checks,
+        "steps": len(steps),
+    }
 
 
 def _score_error_case(steps, name: str, message_substring: str) -> dict:
     error_steps = _find(steps, "error")
     checks = {
         "errored": len(error_steps) == 1,
-        "message_matches": bool(error_steps) and message_substring.lower() in error_steps[0]["message"].lower(),
+        "message_matches": bool(error_steps)
+        and message_substring.lower() in error_steps[0]["message"].lower(),
     }
     passed = all(checks.values())
-    return {"name": name, "expected": "error", "passed": passed, "checks": checks, "steps": len(steps)}
+    return {
+        "name": name,
+        "expected": "error",
+        "passed": passed,
+        "checks": checks,
+        "steps": len(steps),
+    }
 
 
 def case_happy_path():
@@ -117,7 +131,11 @@ def case_json_in_markdown_fence():
 
 
 def case_json_with_preamble_text():
-    prose = "Here is the research brief you requested:\n\n" + json.dumps(VALID_BRIEF) + "\n\nLet me know if you need anything else!"
+    prose = (
+        "Here is the research brief you requested:\n\n"
+        + json.dumps(VALID_BRIEF)
+        + "\n\nLet me know if you need anything else!"
+    )
     responses = [
         tool_use_response([("fetch_url", {"url": "https://example.com/job/123"})]),
         text_response(prose),
@@ -151,9 +169,7 @@ def case_missing_required_field():
 def case_max_iterations_exceeded():
     # Claude never stops asking for tools. With max_iterations patched to 3,
     # the loop must yield exactly one error step citing the limit.
-    responses = [
-        tool_use_response([("search_web", {"query": f"probe {i}"})]) for i in range(10)
-    ]
+    responses = [tool_use_response([("search_web", {"query": f"probe {i}"})]) for i in range(10)]
     tool_results = {"search_web": "No results found."}
     steps = _run_case(responses, tool_results, max_iterations=3)
     return _score_error_case(steps, "max_iterations_exceeded", "max iterations")
@@ -200,5 +216,13 @@ def run_all() -> list[dict]:
         try:
             results.append(case_fn())
         except Exception as e:
-            results.append({"name": case_fn.__name__, "expected": "?", "passed": False, "checks": {"exception": str(e)}, "steps": 0})
+            results.append(
+                {
+                    "name": case_fn.__name__,
+                    "expected": "?",
+                    "passed": False,
+                    "checks": {"exception": str(e)},
+                    "steps": 0,
+                }
+            )
     return results

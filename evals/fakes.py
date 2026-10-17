@@ -1,5 +1,4 @@
 """Fakes for driving agent.orchestrator without hitting the real Anthropic API."""
-import itertools
 
 
 class FakeBlock:

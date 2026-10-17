@@ -1,8 +1,10 @@
+from typing import Any
+
 import httpx
 from bs4 import BeautifulSoup
 from tavily import TavilyClient
+
 from config import settings
-from typing import Any
 
 # ─── Tool Schemas ────────────────────────────────────────────────────────────
 # These are what Claude reads to decide which tool to use and how.
@@ -22,11 +24,11 @@ TOOL_SCHEMAS = [
             "properties": {
                 "url": {
                     "type": "string",
-                    "description": "The full URL to fetch, must start with http:// or https://"
+                    "description": "The full URL to fetch, must start with http:// or https://",
                 }
             },
-            "required": ["url"]
-        }
+            "required": ["url"],
+        },
     },
     {
         "name": "search_web",
@@ -41,30 +43,31 @@ TOOL_SCHEMAS = [
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "The search query. Be specific. Include company name and year for recent news."
+                    "description": "The search query. Be specific. Include company name and year for recent news.",
                 },
                 "max_results": {
                     "type": "integer",
                     "description": "Number of results to return. Default 5, max 10.",
-                    "default": 5
-                }
+                    "default": 5,
+                },
             },
-            "required": ["query"]
-        }
-    }
+            "required": ["query"],
+        },
+    },
 ]
 
 
 # ─── Tool Execution ───────────────────────────────────────────────────────────
 # These are the actual Python functions that run when Claude calls a tool.
 
+
 async def fetch_url(url: str) -> str:
     """Fetch a URL and return clean readable text."""
     try:
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-            response = await client.get(url, headers={
-                "User-Agent": "Mozilla/5.0 (compatible; ResearchBot/1.0)"
-            })
+            response = await client.get(
+                url, headers={"User-Agent": "Mozilla/5.0 (compatible; ResearchBot/1.0)"}
+            )
             response.raise_for_status()
 
         soup = BeautifulSoup(response.text, "html.parser")
@@ -113,9 +116,6 @@ async def execute_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
         return await fetch_url(tool_input["url"])
     elif tool_name == "search_web":
         max_results = min(max(tool_input.get("max_results", 5), 1), 10)
-        return search_web(
-            query=tool_input["query"],
-            max_results=max_results
-        )
+        return search_web(query=tool_input["query"], max_results=max_results)
     else:
         return f"Unknown tool: {tool_name}"

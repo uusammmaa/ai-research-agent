@@ -5,6 +5,7 @@ Runs the real agentic loop (real Anthropic + Tavily API calls, real HTTP
 fetches) against a handful of currently-live remote job postings, sourced at
 run time from RemoteOK's public API so the harness doesn't rot on stale URLs.
 """
+
 import asyncio
 import json
 import time
@@ -26,8 +27,15 @@ def get_live_job_urls(n: int = 3) -> list[dict]:
     )
     resp.raise_for_status()
     listings = [item for item in resp.json() if item.get("url") and item.get("company")]
-    picked = listings[1:1 + n]  # index 0 is API metadata, not a job
-    return [{"url": item["url"], "company": item["company"].strip(), "position": item.get("position", "")} for item in picked]
+    picked = listings[1 : 1 + n]  # index 0 is API metadata, not a job
+    return [
+        {
+            "url": item["url"],
+            "company": item["company"].strip(),
+            "position": item.get("position", ""),
+        }
+        for item in picked
+    ]
 
 
 async def _run_one(job_url: str) -> dict:
@@ -47,7 +55,11 @@ async def _run_one(job_url: str) -> dict:
         async for line in orchestrator.run_agent(job_url):
             steps.append(json.loads(line))
     elapsed = time.monotonic() - start
-    return {"steps": steps, "elapsed_seconds": round(elapsed, 1), "iteration_count": call_count["n"]}
+    return {
+        "steps": steps,
+        "elapsed_seconds": round(elapsed, 1),
+        "iteration_count": call_count["n"],
+    }
 
 
 def _find(steps, type_):
@@ -105,10 +117,19 @@ def run_all(n: int = 3) -> list[dict]:
             run = asyncio.run(_run_one(job["url"]))
             results.append(score_live_run(job, run))
         except Exception as e:
-            results.append({
-                "name": f"live::{job['company']}", "url": job["url"], "expected": "complete",
-                "passed": False, "checks": {"exception": str(e)}, "steps": 0,
-                "tool_call_count": 0, "iteration_count": 0,
-                "elapsed_seconds": None, "error_message": str(e), "brief": None,
-            })
+            results.append(
+                {
+                    "name": f"live::{job['company']}",
+                    "url": job["url"],
+                    "expected": "complete",
+                    "passed": False,
+                    "checks": {"exception": str(e)},
+                    "steps": 0,
+                    "tool_call_count": 0,
+                    "iteration_count": 0,
+                    "elapsed_seconds": None,
+                    "error_message": str(e),
+                    "brief": None,
+                }
+            )
     return results

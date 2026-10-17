@@ -1,8 +1,16 @@
 """Shared scoring logic for the mocked and live eval suites."""
 
 REQUIRED_BRIEF_FIELDS = {
-    "role", "company", "location", "tech_stack", "key_requirements",
-    "company_summary", "culture_signals", "talking_points", "red_flags", "sources",
+    "role",
+    "company",
+    "location",
+    "tech_stack",
+    "key_requirements",
+    "company_summary",
+    "culture_signals",
+    "talking_points",
+    "red_flags",
+    "sources",
 }
 
 

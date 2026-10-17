@@ -50,5 +50,5 @@ BRIEF_SCHEMA = {
     "culture_signals": list,
     "talking_points": list,
     "red_flags": list,
-    "sources": list
+    "sources": list,
 }
