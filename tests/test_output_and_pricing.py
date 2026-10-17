@@ -28,12 +28,12 @@ def brief(**changes) -> dict:
     ],
 )
 def test_extract_json_handles_clean_fenced_and_wrapped(text):
-    assert json.loads(extract_json(text))["company"] == "Acme Corp"
+    assert json.loads(extract_json(text))["company"] == "Example Co"
 
 
 def test_parse_brief_accepts_valid_brief():
     parsed = parse_brief(json.dumps(VALID_BRIEF), retrieved_urls=RETRIEVED)
-    assert parsed.company == "Acme Corp"
+    assert parsed.company == "Example Co"
     assert len(parsed.claims) == 4
 
 
@@ -71,10 +71,10 @@ def test_parse_brief_rejects_claims_citing_unretrieved_urls():
 
 
 def test_url_matching_ignores_trailing_slash_fragment_and_host_case():
-    assert normalize_url("HTTPS://Acme.Example/about/#team") == normalize_url(ABOUT_URL)
+    assert normalize_url("HTTPS://ExampleCo.Example/about/#team") == normalize_url(ABOUT_URL)
     parse_brief(
         json.dumps(VALID_BRIEF),
-        retrieved_urls={JOB_URL + "/", "https://ACME.example/about#top", NEWS_URL},
+        retrieved_urls={JOB_URL + "/", "https://EXAMPLECO.example/about#top", NEWS_URL},
     )
 
 

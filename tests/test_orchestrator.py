@@ -37,7 +37,7 @@ async def test_happy_path_streams_steps_and_summary():
         "complete",
         "run_summary",
     ]
-    assert json.loads(steps[4].output)["company"] == "Acme Corp"
+    assert json.loads(steps[4].output)["company"] == "Example Co"
 
     summary = steps[-1].data
     assert summary["status"] == "complete"

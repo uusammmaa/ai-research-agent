@@ -227,33 +227,33 @@ def by_model(responses: dict[str, Callable[[], Any]]):
 
 JOB_URL = "https://example.com/job/123"
 JOB_PAGE = (
-    "Senior Backend Engineer at Acme Corp. Remote (US time zones). "
+    "Senior Backend Engineer at Example Co. Remote (US time zones). "
     "We build with Python, FastAPI and PostgreSQL. "
     "You have 5+ years of Python and experience with distributed systems. "
     "You will own API design for our payments platform."
 )
-ABOUT_URL = "https://acme.example/about"
-NEWS_URL = "https://news.example/acme-series-b"
+ABOUT_URL = "https://exampleco.example/about"
+NEWS_URL = "https://news.example/exampleco-series-b"
 ABOUT_HIT = SearchHit(
-    "Acme Corp Overview",
+    "Example Co Overview",
     ABOUT_URL,
-    "Acme Corp is a Series B fintech founded in 2019, building payment infrastructure "
+    "Example Co is a Series B fintech founded in 2019, building payment infrastructure "
     "for small businesses. The team of 30 people works async-first with no mandatory meetings.",
 )
 NEWS_HIT = SearchHit(
-    "Acme Corp raises Series B",
+    "Example Co raises Series B",
     NEWS_URL,
-    "Acme Corp raised a $40M Series B in 2025 to expand its payments platform into Europe.",
+    "Example Co raised a $40M Series B in 2025 to expand its payments platform into Europe.",
 )
 SEARCH_HITS = [ABOUT_HIT, NEWS_HIT]
 
 VALID_BRIEF = {
     "role": "Senior Backend Engineer",
-    "company": "Acme Corp",
+    "company": "Example Co",
     "location": "Remote (US time zones)",
     "tech_stack": ["Python", "FastAPI", "PostgreSQL"],
     "key_requirements": ["5+ years Python", "Distributed systems experience", "API design"],
-    "company_summary": "Acme Corp is a Series B fintech founded in 2019, building payment infrastructure for small businesses.",
+    "company_summary": "Example Co is a Series B fintech founded in 2019, building payment infrastructure for small businesses.",
     "culture_signals": ["Async-first, no mandatory meetings", "Small team (30 people)"],
     "talking_points": ["Highlight FastAPI experience", "Mention distributed systems project"],
     "red_flags": [],
@@ -265,9 +265,9 @@ VALID_BRIEF = {
             "quote": "Remote (US time zones).",
         },
         {
-            "statement": "Acme Corp is a Series B fintech founded in 2019.",
+            "statement": "Example Co is a Series B fintech founded in 2019.",
             "source": ABOUT_URL,
-            "quote": "Acme Corp is a Series B fintech founded in 2019",
+            "quote": "Example Co is a Series B fintech founded in 2019",
         },
         {
             "statement": "The team of 30 people works async-first with no mandatory meetings.",
@@ -275,9 +275,9 @@ VALID_BRIEF = {
             "quote": "The team of 30 people works async-first with no mandatory meetings.",
         },
         {
-            "statement": "Acme Corp raised a $40M Series B in 2025.",
+            "statement": "Example Co raised a $40M Series B in 2025.",
             "source": NEWS_URL,
-            "quote": "Acme Corp raised a $40M Series B in 2025",
+            "quote": "Example Co raised a $40M Series B in 2025",
         },
     ],
 }
@@ -289,5 +289,5 @@ def research_turns() -> list[FakeResponse]:
     """The standard opening: read the posting, then search for the company."""
     return [
         tool_use_response([("fetch_url", {"url": JOB_URL})]),
-        tool_use_response([("search_web", {"query": "Acme Corp company overview funding 2025"})]),
+        tool_use_response([("search_web", {"query": "Example Co company overview funding 2025"})]),
     ]

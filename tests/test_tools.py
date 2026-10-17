@@ -153,7 +153,7 @@ async def test_tavily_search_maps_results(fake_tavily):
             {"title": None, "url": None, "content": None},
         ]
     }
-    hits = await tavily_search("acme", 5)
+    hits = await tavily_search("exampleco", 5)
     assert hits[0] == SearchHit("Overview", "https://a.example", "Founded 2019")
     assert hits[1] == SearchHit("N/A", "", "")
 
@@ -161,14 +161,14 @@ async def test_tavily_search_maps_results(fake_tavily):
 async def test_tavily_bad_key_is_not_retryable(fake_tavily):
     fake_tavily.error = InvalidAPIKeyError()
     with pytest.raises(ToolError) as exc:
-        await tavily_search("acme", 5)
+        await tavily_search("exampleco", 5)
     assert exc.value.retryable is False
 
 
 async def test_tavily_other_errors_are_retryable(fake_tavily):
     fake_tavily.error = httpx.ReadTimeout("slow")
     with pytest.raises(ToolError) as exc:
-        await tavily_search("acme", 5)
+        await tavily_search("exampleco", 5)
     assert exc.value.retryable is True
 
 

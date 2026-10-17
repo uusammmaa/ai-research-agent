@@ -210,9 +210,9 @@ def case_unretrieved_citation_repaired():
     hallucinated["sources"].append("https://made-up.example/press")
     hallucinated["claims"].append(
         {
-            "statement": "Acme Corp is profitable.",
+            "statement": "Example Co is profitable.",
             "source": "https://made-up.example/press",
-            "quote": "Acme Corp is profitable",
+            "quote": "Example Co is profitable",
         }
     )
     script = [
@@ -333,7 +333,7 @@ def case_tool_error_recovery():
     # searching for the URL, and Claude completes from the search results.
     # The posting was never fetched, so the brief may only cite JOB_URL
     # because the fallback search returned it.
-    job_hit = SearchHit("Acme Corp Senior Backend Engineer", JOB_URL, JOB_PAGE)
+    job_hit = SearchHit("Example Co Senior Backend Engineer", JOB_URL, JOB_PAGE)
     canned = {
         "fetch_url": ToolError("HTTP error 403 fetching", retryable=False, status_code=403),
         "search_web": [job_hit, *SEARCH_HITS],
@@ -400,8 +400,8 @@ def case_fabricated_quote_flagged():
     # Real source, invented quote and fact.
     brief = _brief_with(
         1,
-        statement="Acme Corp was founded in 2021.",
-        quote="Acme Corp was founded in 2021",
+        statement="Example Co was founded in 2021.",
+        quote="Example Co was founded in 2021",
     )
     return _grounding_case("fabricated_quote_flagged", brief, "quote not in cited source")
 
@@ -414,7 +414,7 @@ def case_misattributed_source_flagged():
 
 def case_changed_number_flagged():
     # The quote is right, the statement inflates the number.
-    brief = _brief_with(3, statement="Acme Corp raised a $50M Series B in 2025.")
+    brief = _brief_with(3, statement="Example Co raised a $50M Series B in 2025.")
     return _grounding_case("changed_number_flagged", brief, "numbers not in source")
 
 

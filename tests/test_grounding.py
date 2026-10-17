@@ -22,7 +22,9 @@ def test_valid_brief_is_fully_grounded():
 
 
 def test_unretrieved_source_fails_citation_and_support():
-    s = score_claim(claim("Acme is profitable.", "https://elsewhere.example", "profitable"), CORPUS)
+    s = score_claim(
+        claim("Example Co is profitable.", "https://elsewhere.example", "profitable"), CORPUS
+    )
     assert not s.cites_retrieved_source
     assert not s.supported
     assert s.reason == "source not retrieved"
@@ -30,7 +32,11 @@ def test_unretrieved_source_fails_citation_and_support():
 
 def test_fabricated_quote_is_unsupported():
     s = score_claim(
-        claim("Acme was founded in 2019.", ABOUT_URL, "Acme was founded in 2019 by two engineers"),
+        claim(
+            "Example Co was founded in 2019.",
+            ABOUT_URL,
+            "Example Co was founded in 2019 by two engineers",
+        ),
         CORPUS,
     )
     assert s.cites_retrieved_source
@@ -39,7 +45,7 @@ def test_fabricated_quote_is_unsupported():
 
 
 def test_changed_number_is_unsupported_even_with_a_real_quote():
-    s = score_claim(claim("Acme raised $50M.", NEWS_URL, "raised a $40M Series B"), CORPUS)
+    s = score_claim(claim("Example Co raised $50M.", NEWS_URL, "raised a $40M Series B"), CORPUS)
     assert s.quote_found
     assert not s.numbers_supported
     assert "50" in s.reason
