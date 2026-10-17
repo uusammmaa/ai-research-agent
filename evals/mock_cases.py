@@ -15,6 +15,7 @@ import json
 from agent.models import AgentStep
 from agent.tools import SearchHit, ToolError
 from evals.fakes import (
+    ABOUT_URL,
     CANNED_TOOLS,
     HANG,
     JOB_PAGE,
@@ -31,6 +32,7 @@ from evals.fakes import (
     text_response,
     tool_use_response,
 )
+from evals.grounding import grounding_report
 from evals.scoring import is_valid_research_brief
 
 
@@ -71,7 +73,9 @@ def _run_metrics(state) -> dict:
     }
 
 
-def _score_success_case(steps, state, name: str, extra_checks: dict | None = None) -> dict:
+def _score_success_case(
+    steps, state, name: str, extra_checks: dict | None = None, expect_grounded: bool = True
+) -> dict:
     checks = {}
     complete_steps = _find(steps, "complete")
     error_steps = _find(steps, "error")
@@ -79,6 +83,7 @@ def _score_success_case(steps, state, name: str, extra_checks: dict | None = Non
     checks["completed"] = len(complete_steps) == 1 and len(error_steps) == 0
 
     valid_schema = False
+    brief = None
     if complete_steps:
         try:
             brief = json.loads(complete_steps[0]["output"])
@@ -86,6 +91,13 @@ def _score_success_case(steps, state, name: str, extra_checks: dict | None = Non
         except Exception:
             valid_schema = False
     checks["valid_schema"] = valid_schema
+
+    grounding = grounding_report(brief, state.corpus) if brief else None
+    checks["claims_cite_retrieved_sources"] = (
+        bool(grounding) and grounding["citation_accuracy"] == 1.0
+    )
+    if expect_grounded:
+        checks["claims_grounded"] = bool(grounding) and grounding["groundedness"] == 1.0
 
     tool_calls = _find(steps, "tool_call")
     checks["first_tool_is_fetch_url"] = (
@@ -100,6 +112,7 @@ def _score_success_case(steps, state, name: str, extra_checks: dict | None = Non
         "passed": passed,
         "checks": checks,
         "steps": len(steps),
+        "grounding": grounding,
         **_run_metrics(state),
     }
 
@@ -355,6 +368,56 @@ def case_tool_timeout_is_error_result():
     )
 
 
+# ─── Groundedness and citation accuracy ──────────────────────────────────────
+# The agent's guard only rejects citations to pages it never retrieved.
+# Whether the retrieved page supports the claim is the eval's job, so these
+# cases complete and the scorer has to catch the problem. They check the
+# metric, not just the agent.
+
+
+def _brief_with(claim_index: int, **changes) -> dict:
+    brief = json.loads(json.dumps(VALID_BRIEF))
+    brief["claims"][claim_index].update(changes)
+    return brief
+
+
+def _grounding_case(name: str, brief: dict, expect_reason: str):
+    script = [*research_turns(), text_response(json.dumps(brief))]
+    steps, state, _ = _run_case(script, CANNED_TOOLS)
+    result = _score_success_case(steps, state, name, expect_grounded=False)
+    grounding = result["grounding"] or {}
+    unsupported = grounding.get("unsupported", [])
+    result["checks"]["scorer_flags_exactly_one_claim"] = len(unsupported) == 1
+    result["checks"]["scorer_gives_right_reason"] = (
+        bool(unsupported) and expect_reason in unsupported[0]["reason"]
+    )
+    result["expected"] = "complete, 1 claim flagged"
+    result["passed"] = all(result["checks"].values())
+    return result
+
+
+def case_fabricated_quote_flagged():
+    # Real source, invented quote and fact.
+    brief = _brief_with(
+        1,
+        statement="Acme Corp was founded in 2021.",
+        quote="Acme Corp was founded in 2021",
+    )
+    return _grounding_case("fabricated_quote_flagged", brief, "quote not in cited source")
+
+
+def case_misattributed_source_flagged():
+    # The quote is real but lives on a different page than the one cited.
+    brief = _brief_with(3, source=ABOUT_URL)
+    return _grounding_case("misattributed_source_flagged", brief, "quote not in cited source")
+
+
+def case_changed_number_flagged():
+    # The quote is right, the statement inflates the number.
+    brief = _brief_with(3, statement="Acme Corp raised a $50M Series B in 2025.")
+    return _grounding_case("changed_number_flagged", brief, "numbers not in source")
+
+
 ALL_CASES = [
     case_happy_path,
     case_json_in_markdown_fence,
@@ -371,6 +434,9 @@ ALL_CASES = [
     case_tool_transient_error_retried,
     case_tool_error_recovery,
     case_tool_timeout_is_error_result,
+    case_fabricated_quote_flagged,
+    case_misattributed_source_flagged,
+    case_changed_number_flagged,
 ]
 
 
