@@ -18,6 +18,8 @@ class Settings(BaseSettings):
     max_tokens: int = 16000
     # Server-side refusal fallback (beta) on the models that support it.
     refusal_fallback: bool = True
+    # Automatic prompt caching of the repeated system/tools/history prefix.
+    prompt_caching: bool = True
 
     # Run guards
     max_iterations: int = 10

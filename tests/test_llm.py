@@ -70,6 +70,13 @@ def test_request_params_per_model():
     assert "extra_body" not in no_fallback.request_params("claude-opus-5-5")
 
 
+def test_prompt_caching_toggle():
+    cached, _ = client([], prompt_caching=True)
+    assert cached.request_params("claude-opus-5-5")["cache_control"] == {"type": "ephemeral"}
+    uncached, _ = client([], prompt_caching=False)
+    assert "cache_control" not in uncached.request_params("claude-opus-5-5")
+
+
 async def test_retries_overloaded_then_succeeds(spans):
     llm, fake = client([overloaded_error(), text_response("done")])
     call = await create(llm)

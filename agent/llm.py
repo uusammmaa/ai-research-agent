@@ -63,6 +63,7 @@ class LLMClient:
         effort: str | None = None,
         max_tokens: int | None = None,
         refusal_fallback: bool | None = None,
+        prompt_caching: bool | None = None,
         retry_policy: RetryPolicy | None = None,
         timeout: float | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -77,6 +78,7 @@ class LLMClient:
         self.refusal_fallback = (
             settings.refusal_fallback if refusal_fallback is None else refusal_fallback
         )
+        self.prompt_caching = settings.prompt_caching if prompt_caching is None else prompt_caching
         self.retry_policy = retry_policy or RetryPolicy(max_attempts=settings.llm_max_attempts)
         self.timeout = timeout if timeout is not None else settings.llm_timeout_seconds
         self._sleep = sleep
@@ -86,6 +88,11 @@ class LLMClient:
 
     def request_params(self, model: str) -> dict[str, Any]:
         params: dict[str, Any] = {"model": model, "max_tokens": self.max_tokens}
+        if self.prompt_caching:
+            # Every turn resends the system prompt, tools and the growing
+            # history; automatic caching bills the repeated prefix at the
+            # cache-read rate instead of full input price.
+            params["cache_control"] = {"type": "ephemeral"}
         info = model_info(model)
         if info is not None and info.supports_effort:
             params["output_config"] = {"effort": self.effort}
