@@ -9,7 +9,6 @@ run time from RemoteOK's public API so the harness doesn't rot on stale URLs.
 import asyncio
 import json
 import time
-from unittest.mock import patch
 
 import httpx
 
@@ -39,26 +38,20 @@ def get_live_job_urls(n: int = 3) -> list[dict]:
 
 
 async def _run_one(job_url: str) -> dict:
-    """Runs the real agent, counting actual loop iterations (API calls) rather
-    than tool_call steps — a single iteration's response can contain multiple
-    tool_use blocks, so tool-call count alone overstates iterations used."""
+    """Runs the real agent. iteration_count is LLM calls (RunState.llm_calls)
+    rather than tool_call steps: one response can hold several tool_use
+    blocks, so tool-call count alone overstates iterations used."""
+    agent = orchestrator.ResearchAgent()
     steps = []
-    call_count = {"n": 0}
-    original_create = orchestrator.client.messages.create
-
-    def counting_create(*args, **kwargs):
-        call_count["n"] += 1
-        return original_create(*args, **kwargs)
-
     start = time.monotonic()
-    with patch.object(orchestrator.client.messages, "create", side_effect=counting_create):
-        async for line in orchestrator.run_agent(job_url):
-            steps.append(json.loads(line))
+    async for step in agent.run(job_url):
+        steps.append(json.loads(step.model_dump_json(exclude_none=True)))
     elapsed = time.monotonic() - start
     return {
         "steps": steps,
         "elapsed_seconds": round(elapsed, 1),
-        "iteration_count": call_count["n"],
+        "iteration_count": agent.state.llm_calls,
+        "state": agent.state,
     }
 
 

@@ -10,6 +10,7 @@ Usage (from backend/, with venv active):
 
 import argparse
 import json
+import logging
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -31,6 +32,8 @@ def main():
     parser.add_argument("--live-only", action="store_true", help="skip mocked suite, run live only")
     parser.add_argument("-n", type=int, default=3, help="number of live job URLs to test")
     args = parser.parse_args()
+    # Retry and fallback warnings are expected in the mock suite; keep output readable.
+    logging.basicConfig(level=logging.ERROR)
 
     mock_results = [] if args.live_only else mock_cases.run_all()
     live_results = live_cases.run_all(args.n) if (args.live or args.live_only) else []
