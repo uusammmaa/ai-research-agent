@@ -1,6 +1,10 @@
 # Secrets
 .env
-.env.local
+.env.*
+!.env.example
+
+# Generated eval output (may contain live run data)
+evals/results.json
 
 # Python
 venv/
