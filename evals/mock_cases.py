@@ -51,6 +51,11 @@ def _find(steps, type_):
     return [s for s in steps if s["type"] == type_]
 
 
+def _outcomes(steps) -> list[str]:
+    """Step types other than the trailing run_summary."""
+    return [s["type"] for s in steps if s["type"] != "run_summary"]
+
+
 def _run_metrics(state) -> dict:
     return {
         "llm_calls": state.llm_calls,
@@ -59,6 +64,10 @@ def _run_metrics(state) -> dict:
         "tool_attempts": state.tool_attempts,
         "repairs": state.repairs,
         "models_used": state.models_used,
+        "input_tokens": state.usage.input_tokens,
+        "output_tokens": state.usage.output_tokens,
+        "cost_usd": round(state.usage.cost_usd, 6),
+        "cost_by_model": {m: round(u.cost_usd, 6) for m, u in state.usage.by_model.items()},
     }
 
 
@@ -103,7 +112,7 @@ def _score_error_case(
         "errored": len(error_steps) == 1,
         "message_matches": bool(error_steps)
         and message_substring.lower() in error_steps[0]["message"].lower(),
-        "error_is_last_step": bool(steps) and steps[-1]["type"] == "error",
+        "error_is_final_outcome": _outcomes(steps)[-1:] == ["error"],
     }
     checks.update(extra_checks or {})
     passed = all(checks.values())

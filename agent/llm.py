@@ -8,9 +8,13 @@ from dataclasses import dataclass
 from typing import Any
 
 import anthropic
+from opentelemetry import trace
+from opentelemetry.trace import SpanKind, Status, StatusCode
 
 from agent.pricing import model_info
 from agent.reliability import Deadline, RetryPolicy, retry_async
+from agent.telemetry import get_tracer
+from agent.usage import RunUsage
 from config import settings
 
 log = logging.getLogger(__name__)
@@ -28,6 +32,11 @@ def is_retryable_llm_error(exc: BaseException) -> bool:
         # 408 timeout, 409 conflict, 429 rate limit, 5xx including 529 overloaded.
         return exc.status_code in (408, 409, 429) or exc.status_code >= 500
     return False
+
+
+def _served_by(response: Any, requested: str) -> str:
+    # Differs from the requested model when the server-side refusal fallback ran.
+    return getattr(response, "model", None) or requested
 
 
 @dataclass
@@ -88,32 +97,80 @@ class LLMClient:
         return params
 
     async def _create_with_retries(
-        self, model: str, request: dict[str, Any], deadline: Deadline | None, counter: list[int]
+        self,
+        model: str,
+        request: dict[str, Any],
+        deadline: Deadline | None,
+        counter: list[int],
+        usage: RunUsage | None,
     ) -> Any:
         params = {**self.request_params(model), **request}
+        tracer = get_tracer()
+        with tracer.start_as_current_span(f"chat {model}", kind=SpanKind.CLIENT) as span:
+            span.set_attribute("gen_ai.operation.name", "chat")
+            span.set_attribute("gen_ai.provider.name", "anthropic")
+            span.set_attribute("gen_ai.request.model", model)
+            span.set_attribute("gen_ai.request.max_tokens", self.max_tokens)
+            if "output_config" in params:
+                span.set_attribute("gen_ai.request.effort", self.effort)
+            attempts_before = counter[0]
 
-        async def attempt():
-            counter[0] += 1
-            timeout = deadline.cap(self.timeout) if deadline else self.timeout
-            return await asyncio.wait_for(self._client.messages.create(**params), timeout=timeout)
+            async def attempt():
+                counter[0] += 1
+                timeout = deadline.cap(self.timeout) if deadline else self.timeout
+                return await asyncio.wait_for(
+                    self._client.messages.create(**params), timeout=timeout
+                )
 
-        def on_retry(attempt_no: int, delay: float, exc: BaseException) -> None:
-            log.warning(
-                "LLM call to %s failed (attempt %d): %r; retrying in %.2fs",
-                model,
-                attempt_no,
-                exc,
-                delay,
-            )
+            def on_retry(attempt_no: int, delay: float, exc: BaseException) -> None:
+                span.add_event(
+                    "retry",
+                    {
+                        "attempt": attempt_no,
+                        "delay_s": round(delay, 3),
+                        "error.type": type(exc).__name__,
+                    },
+                )
+                log.warning(
+                    "LLM call to %s failed (attempt %d): %r; retrying in %.2fs",
+                    model,
+                    attempt_no,
+                    exc,
+                    delay,
+                )
 
-        return await retry_async(
-            attempt,
-            policy=self.retry_policy,
-            is_retryable=is_retryable_llm_error,
-            deadline=deadline,
-            on_retry=on_retry,
-            sleep=self._sleep,
-        )
+            try:
+                response = await retry_async(
+                    attempt,
+                    policy=self.retry_policy,
+                    is_retryable=is_retryable_llm_error,
+                    deadline=deadline,
+                    on_retry=on_retry,
+                    sleep=self._sleep,
+                )
+            except Exception as exc:
+                span.set_attribute("llm.attempts", counter[0] - attempts_before)
+                span.set_attribute("error.type", type(exc).__name__)
+                span.set_status(Status(StatusCode.ERROR, str(exc)))
+                raise
+
+            served_by = _served_by(response, model)
+            span.set_attribute("llm.attempts", counter[0] - attempts_before)
+            span.set_attribute("gen_ai.response.model", served_by)
+            if getattr(response, "id", None):
+                span.set_attribute("gen_ai.response.id", response.id)
+            span.set_attribute("gen_ai.response.finish_reasons", [str(response.stop_reason)])
+            if usage is not None:
+                call = usage.record(served_by, getattr(response, "usage", None))
+                span.set_attribute("gen_ai.usage.input_tokens", call.input_tokens)
+                span.set_attribute("gen_ai.usage.output_tokens", call.output_tokens)
+                span.set_attribute("gen_ai.usage.cache_read.input_tokens", call.cache_read_tokens)
+                span.set_attribute(
+                    "gen_ai.usage.cache_creation.input_tokens", call.cache_write_tokens
+                )
+                if call.cost_usd is not None:
+                    span.set_attribute("llm.cost_usd", call.cost_usd)
+            return response
 
     async def create(
         self,
@@ -122,13 +179,14 @@ class LLMClient:
         tools: list[dict[str, Any]],
         messages: list[dict[str, Any]],
         deadline: Deadline | None = None,
+        usage: RunUsage | None = None,
     ) -> LLMCall:
         request = {"system": system, "tools": tools, "messages": messages}
         counter = [0]
         model = self.active_model
         try:
-            response = await self._create_with_retries(model, request, deadline, counter)
-            return LLMCall(response, model, counter[0], fell_back=False)
+            response = await self._create_with_retries(model, request, deadline, counter, usage)
+            return LLMCall(response, _served_by(response, model), counter[0], fell_back=False)
         except Exception as exc:
             can_fall_back = (
                 is_retryable_llm_error(exc)
@@ -144,7 +202,14 @@ class LLMClient:
                 exc,
                 self.fallback_model,
             )
+            trace.get_current_span().add_event(
+                "model_fallback", {"from": model, "to": self.fallback_model}
+            )
 
         self.active_model = self.fallback_model
-        response = await self._create_with_retries(self.active_model, request, deadline, counter)
-        return LLMCall(response, self.active_model, counter[0], fell_back=True)
+        response = await self._create_with_retries(
+            self.active_model, request, deadline, counter, usage
+        )
+        return LLMCall(
+            response, _served_by(response, self.active_model), counter[0], fell_back=True
+        )

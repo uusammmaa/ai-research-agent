@@ -7,9 +7,12 @@ from urllib.parse import urlparse
 
 import httpx
 from bs4 import BeautifulSoup
+from opentelemetry import trace
+from opentelemetry.trace import Status, StatusCode
 from tavily import AsyncTavilyClient, BadRequestError, InvalidAPIKeyError, MissingAPIKeyError
 
 from agent.reliability import Deadline, RetryPolicy, retry_async
+from agent.telemetry import get_tracer
 from config import settings
 
 MAX_PAGE_CHARS = 8000
@@ -271,11 +274,23 @@ class ToolExecutor:
             timeout = deadline.cap(self.timeout) if deadline else self.timeout
             return await asyncio.wait_for(fn(), timeout=timeout)
 
+        def on_retry(attempt_no: int, delay: float, exc: BaseException) -> None:
+            trace.get_current_span().add_event(
+                "retry",
+                {
+                    "attempt": attempt_no,
+                    "delay_s": round(delay, 3),
+                    "error.type": type(exc).__name__,
+                    "error.message": _describe(exc)[:200],
+                },
+            )
+
         return await retry_async(
             attempt,
             policy=self.retry_policy,
             is_retryable=_is_retryable_tool_error,
             deadline=deadline,
+            on_retry=on_retry,
             sleep=self._sleep,
         )
 
@@ -287,16 +302,40 @@ class ToolExecutor:
         return format_search_hits(hits), sources
 
     async def execute(
-        self, tool_name: str, tool_input: dict[str, Any], deadline: Deadline | None = None
+        self,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        deadline: Deadline | None = None,
+        call_id: str | None = None,
     ) -> ToolResult:
-        """Route tool calls to the right function."""
-        if tool_name == "fetch_url":
-            return await self._execute_fetch(tool_input, deadline)
-        if tool_name == "search_web":
-            return await self._execute_search(tool_input, deadline)
-        return ToolResult(
-            content=f"Unknown tool: {tool_name}", is_error=True, error="unknown_tool", attempts=0
-        )
+        """Route tool calls to the right function, inside an execute_tool span."""
+        with get_tracer().start_as_current_span(f"execute_tool {tool_name}") as span:
+            span.set_attribute("gen_ai.operation.name", "execute_tool")
+            span.set_attribute("gen_ai.tool.name", tool_name)
+            if call_id:
+                span.set_attribute("gen_ai.tool.call.id", call_id)
+            if tool_name == "fetch_url":
+                result = await self._execute_fetch(tool_input, deadline)
+            elif tool_name == "search_web":
+                result = await self._execute_search(tool_input, deadline)
+            else:
+                result = ToolResult(
+                    content=f"Unknown tool: {tool_name}",
+                    is_error=True,
+                    error="unknown_tool",
+                    attempts=0,
+                )
+            span.set_attribute("tool.attempts", result.attempts)
+            span.set_attribute("tool.is_error", result.is_error)
+            span.set_attribute("tool.sources", len(result.sources))
+            span.set_attribute("tool.result_chars", len(result.content))
+            if result.fallback:
+                span.set_attribute("tool.fallback", result.fallback)
+            if result.error:
+                span.set_attribute("tool.error", result.error)
+            if result.is_error:
+                span.set_status(Status(StatusCode.ERROR, result.error or result.content[:200]))
+            return result
 
     async def _execute_fetch(self, tool_input: dict[str, Any], deadline: Deadline | None):
         url = tool_input.get("url")
@@ -313,6 +352,9 @@ class ToolExecutor:
 
         # Fallback: job boards often block scrapers, but search engines have
         # indexed the posting. Search for the URL itself.
+        trace.get_current_span().add_event(
+            "tool_fallback", {"from": "fetch_url", "to": "search_web"}
+        )
         try:
             content, sources = await self._run_search(url, 5, deadline, attempts)
         except (ToolError, TimeoutError) as e:

@@ -1,12 +1,23 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from agent.orchestrator import ResearchAgent, run_agent
+from agent.telemetry import setup_tracing, shutdown_tracing
 from config import get_cors_origins, settings
 
-app = FastAPI(title="AI Research Agent API")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    setup_tracing()
+    yield
+    shutdown_tracing()  # flush batched spans before the process exits
+
+
+app = FastAPI(title="AI Research Agent API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -32,7 +43,11 @@ class AgentRequest(BaseModel):
 
 @app.post("/agent/run")
 async def run_agent_endpoint(request: AgentRequest):
-    """Run the research agent and stream steps as newline-delimited JSON."""
+    """Run the research agent and stream steps as newline-delimited JSON.
+
+    The last line is a run_summary step with token usage, cost per model and
+    the trace id to look the run up in the tracing backend.
+    """
     if not settings.anthropic_api_key or not settings.tavily_api_key:
         raise HTTPException(
             status_code=503, detail="ANTHROPIC_API_KEY and TAVILY_API_KEY must be configured"

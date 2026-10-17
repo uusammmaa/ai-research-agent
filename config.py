@@ -30,6 +30,16 @@ class Settings(BaseSettings):
     llm_max_attempts: int = 3
     tool_max_attempts: int = 3
 
+    # Tracing: console | console_json | otlp | langfuse | langsmith | none (comma-separated)
+    tracing_exporter: str = "console"
+    tracing_service_name: str = "ai-research-agent"
+    langfuse_public_key: str = ""
+    langfuse_secret_key: str = ""
+    langfuse_host: str = "https://cloud.langfuse.com"
+    langsmith_api_key: str = ""
+    langsmith_project: str = "ai-research-agent"
+    langsmith_endpoint: str = "https://api.smith.langchain.com"
+
     cors_origins: str = "http://localhost:3000"
 
 
