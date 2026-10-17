@@ -147,7 +147,7 @@ Langfuse and LangSmith are reached through their OTLP endpoints, so there is no 
 | Model never stops calling tools | `MAX_ITERATIONS` research turns | `agent/orchestrator.py` |
 | Run takes too long | `RUN_TIMEOUT_SECONDS` deadline shared by every call; per-call timeouts are capped to the time left, and retries stop when the next backoff would overrun it | `agent/reliability.py` |
 | Final answer is not valid JSON, misses fields, or cites URLs it never retrieved | Pydantic validation; the errors go back to Claude as a repair prompt, up to `MAX_REPAIR_ATTEMPTS` times. Repair turns do not consume the research budget. | `agent/output.py`, `agent/models.py` |
-| URL points at localhost or a private IP | `fetch_url` refuses it | `agent/tools.py` |
+| URL points at localhost or a private IP, directly or via a redirect | `fetch_url` refuses it and does not fall back to search | `agent/tools.py` |
 
 ## Cost per run
 
@@ -219,7 +219,7 @@ Checks (the same ones CI runs):
 
 ```bash
 ruff check . && ruff format --check .
-pytest -q                     # 91 tests, mocked LLM and tools
+pytest -q                     # 105 tests, mocked LLM and tools
 python -m evals.run_evals     # mock eval suite
 ```
 
@@ -253,5 +253,5 @@ main.py             FastAPI app
 - **Fallback model trades quality for availability.** When the primary is overloaded the run continues on a cheaper model rather than failing. Set `FALLBACK_MODEL=` to disable.
 - **Retries cost money.** Up to `LLM_MAX_ATTEMPTS` per turn. Every retry is a span event and counted in `run_summary`, so it is visible, not hidden.
 - **Cost figures come from a local price table.** They make cost visible per run and per model; they are not a billing source. Check current prices before relying on them, and update `agent/pricing.py` when they change. With the server-side refusal fallback, a rescued turn is attributed to the model the API reports in the response.
-- **The URL guard is not a full SSRF defence.** It blocks non-HTTP schemes and private or loopback IP literals but does not resolve DNS. Run the service without access to internal networks.
+- **The URL guard is not a full SSRF defence.** It blocks non-HTTP schemes and non-public IP literals (checked on every redirect hop) and caps page size, but does not resolve DNS, so a public hostname pointing at a private address gets through. Run the service without access to internal networks.
 - **Mock evals test the harness, not the model.** They prove the loop, guards and scorer behave correctly. Answer quality comes from the live suite, which depends on whichever job postings are live that day.
