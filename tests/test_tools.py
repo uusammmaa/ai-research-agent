@@ -8,6 +8,7 @@ from agent import tools
 from agent.reliability import Deadline, RetryPolicy, RunTimeoutError
 from agent.tools import (
     MAX_PAGE_CHARS,
+    BlockedURLError,
     SearchHit,
     ToolError,
     ToolExecutor,
@@ -54,6 +55,9 @@ def executor(fetch=None, search=None, **kwargs) -> ToolExecutor:
         "http://192.168.1.1/",
         "http://169.254.169.254/latest/meta-data/",
         "http://[::1]/",
+        "http://[::ffff:127.0.0.1]/",
+        "http://0.0.0.0:8000/",
+        "http://100.64.0.1/",
         "https://",
     ],
 )
@@ -106,6 +110,50 @@ async def test_fetch_page_classifies_http_errors(status, retryable):
         await fetch_page("https://jobs.example.com/1", transport=transport(status=status))
     assert exc.value.status_code == status
     assert exc.value.retryable is retryable
+
+
+async def test_fetch_page_blocks_redirects_to_internal_addresses():
+    requested = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(str(request.url))
+        if request.url.host == "jobs.example.com":
+            return httpx.Response(
+                302,
+                headers={"location": "http://169.254.169.254/latest/meta-data/"},
+                request=request,
+            )
+        return httpx.Response(200, text="<p>instance credentials</p>", request=request)
+
+    with pytest.raises(BlockedURLError):
+        await fetch_page("https://jobs.example.com/1", transport=httpx.MockTransport(handler))
+    assert requested == ["https://jobs.example.com/1"]
+
+
+async def test_fetch_page_follows_public_redirects():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/old":
+            return httpx.Response(301, headers={"location": "/new"}, request=request)
+        return httpx.Response(200, text="<p>Moved posting</p>", request=request)
+
+    text = await fetch_page("https://jobs.example.com/old", transport=httpx.MockTransport(handler))
+    assert text == "Moved posting"
+
+
+async def test_fetch_page_stops_reading_large_bodies(monkeypatch):
+    monkeypatch.setattr(tools, "MAX_PAGE_BYTES", 1_000)
+    html = "<p>" + "x" * 50_000 + "</p>"
+    text = await fetch_page("https://jobs.example.com/1", transport=transport(body=html))
+    assert len(text) <= 1_000
+
+
+async def test_fetch_page_redirect_loops_are_tool_errors():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(302, headers={"location": "/loop"}, request=request)
+
+    with pytest.raises(ToolError) as exc:
+        await fetch_page("https://jobs.example.com/loop", transport=httpx.MockTransport(handler))
+    assert exc.value.retryable is False
 
 
 async def test_fetch_page_network_errors_are_retryable():
@@ -243,6 +291,26 @@ async def test_executor_timeouts_retry_then_fall_back():
     assert result.attempts == 4  # 3 fetch attempts + 1 search
 
 
+async def test_executor_does_not_fall_back_for_blocked_urls():
+    searched = []
+
+    async def fetch(url):
+        validate_public_url(url)
+        return "unreachable"
+
+    async def search(query, max_results):
+        searched.append(query)
+        return []
+
+    result = await executor(fetch=fetch, search=search).execute(
+        "fetch_url", {"url": "http://127.0.0.1:8080/admin"}
+    )
+    assert result.is_error
+    assert result.error == "blocked_url"
+    assert result.fallback is None
+    assert searched == []
+
+
 async def test_executor_reports_error_when_fallback_fails_too(spans):
     async def fetch(url):
         raise ToolError("HTTP error 403", retryable=False)
@@ -257,6 +325,18 @@ async def test_executor_reports_error_when_fallback_fails_too(spans):
     assert "fallback search also failed" in result.content
     (span,) = by_name(spans, "execute_tool fetch_url")
     assert span.status.is_ok is False
+
+
+async def test_executor_turns_unexpected_exceptions_into_error_results(spans):
+    async def buggy(url):
+        raise KeyError("parser blew up")
+
+    result = await executor(fetch=buggy).execute("fetch_url", {"url": "https://jobs.example/1"})
+    assert result.is_error
+    assert result.error == "internal_error"
+    assert "KeyError" in result.content
+    (span,) = by_name(spans, "execute_tool fetch_url")
+    assert "exception" in [e.name for e in span.events]
 
 
 async def test_executor_clamps_max_results():

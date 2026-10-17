@@ -11,11 +11,12 @@ from opentelemetry import trace
 from opentelemetry.trace import Status, StatusCode
 from tavily import AsyncTavilyClient, BadRequestError, InvalidAPIKeyError, MissingAPIKeyError
 
-from agent.reliability import Deadline, RetryPolicy, retry_async
+from agent.reliability import Deadline, RetryPolicy, RunTimeoutError, retry_async
 from agent.telemetry import get_tracer
 from config import settings
 
 MAX_PAGE_CHARS = 8000
+MAX_PAGE_BYTES = 2_000_000
 
 # ─── Tool Schemas ────────────────────────────────────────────────────────────
 # These are what Claude reads to decide which tool to use and how.
@@ -82,6 +83,14 @@ class ToolError(Exception):
         self.status_code = status_code
 
 
+class BlockedURLError(ToolError):
+    """The URL was refused by the safety guard. Never retried, and no search
+    fallback: searching for an internal address is pointless."""
+
+    def __init__(self, message: str):
+        super().__init__(message, retryable=False)
+
+
 @dataclass
 class SearchHit:
     title: str
@@ -115,25 +124,26 @@ def validate_public_url(url: str) -> None:
     """Reject non-HTTP schemes and obvious internal targets.
 
     The URL comes from model output, which can be steered by page content, so
-    it is untrusted. This blocks the cheap SSRF cases (localhost, private and
-    link-local IP literals). It does not resolve DNS, so a public hostname that
-    resolves to a private address is not caught; run the service without
-    access to internal networks for that.
+    it is untrusted. This blocks the cheap SSRF cases (localhost and any
+    non-global IP literal: private, loopback, link-local, shared, reserved),
+    and fetch_page applies it to every redirect hop. It does not resolve DNS,
+    so a public hostname that resolves to a private address is not caught;
+    run the service without access to internal networks for that.
     """
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        raise ToolError(
-            f"Refusing to fetch {url!r}: only http(s) URLs are allowed", retryable=False
-        )
+        raise BlockedURLError(f"Refusing to fetch {url!r}: only http(s) URLs are allowed")
     host = parsed.hostname.lower()
     if host == "localhost" or host.endswith(".localhost") or host.endswith(".internal"):
-        raise ToolError(f"Refusing to fetch internal host {host!r}", retryable=False)
+        raise BlockedURLError(f"Refusing to fetch internal host {host!r}")
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:
         return
-    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
-        raise ToolError(f"Refusing to fetch non-public address {host!r}", retryable=False)
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped  # ::ffff:127.0.0.1 is 127.0.0.1
+    if not ip.is_global or ip.is_multicast:
+        raise BlockedURLError(f"Refusing to fetch non-public address {host!r}")
 
 
 def _is_retryable_status(status: int) -> bool:
@@ -155,17 +165,39 @@ def html_to_text(html: str) -> str:
     return text
 
 
+async def _check_redirect_target(request: httpx.Request) -> None:
+    # httpx runs request hooks for every hop, so a public URL that redirects
+    # to an internal address is stopped before the redirect is followed.
+    validate_public_url(str(request.url))
+
+
 async def fetch_page(url: str, *, transport: httpx.AsyncBaseTransport | None = None) -> str:
     """Fetch a URL and return clean readable text."""
     validate_public_url(url)
     try:
-        async with httpx.AsyncClient(
-            timeout=settings.tool_timeout_seconds, follow_redirects=True, transport=transport
-        ) as client:
-            response = await client.get(
-                url, headers={"User-Agent": "Mozilla/5.0 (compatible; ResearchBot/1.0)"}
-            )
+        async with (
+            httpx.AsyncClient(
+                timeout=settings.tool_timeout_seconds,
+                follow_redirects=True,
+                max_redirects=5,
+                transport=transport,
+                event_hooks={"request": [_check_redirect_target]},
+            ) as client,
+            client.stream(
+                "GET", url, headers={"User-Agent": "Mozilla/5.0 (compatible; ResearchBot/1.0)"}
+            ) as response,
+        ):
             response.raise_for_status()
+            # Stop reading at MAX_PAGE_BYTES: only the first MAX_PAGE_CHARS
+            # of text are kept, and the URL is model-chosen.
+            body = bytearray()
+            async for chunk in response.aiter_bytes():
+                body.extend(chunk)
+                if len(body) >= MAX_PAGE_BYTES:
+                    break
+            html = bytes(body[:MAX_PAGE_BYTES]).decode(
+                response.encoding or "utf-8", errors="replace"
+            )
     except httpx.HTTPStatusError as e:
         status = e.response.status_code
         raise ToolError(
@@ -173,11 +205,17 @@ async def fetch_page(url: str, *, transport: httpx.AsyncBaseTransport | None = N
             retryable=_is_retryable_status(status),
             status_code=status,
         ) from e
+    except httpx.TooManyRedirects as e:
+        raise ToolError(f"Too many redirects fetching {url}", retryable=False) from e
     except httpx.TransportError as e:
         # Timeouts, DNS failures, resets: all transient from our point of view.
         raise ToolError(f"Network error fetching {url}: {e!r}", retryable=True) from e
+    except httpx.HTTPError as e:
+        # Decoding errors, invalid redirect URLs and the like: retrying won't help.
+        raise ToolError(f"Error fetching {url}: {e!r}", retryable=False) from e
 
-    text = html_to_text(response.text)
+    # Parsing a large page is CPU-bound; keep it off the event loop.
+    text = await asyncio.to_thread(html_to_text, html)
     if not text:
         raise ToolError(f"No readable content found at {url}", retryable=False)
     return text
@@ -314,16 +352,29 @@ class ToolExecutor:
             span.set_attribute("gen_ai.tool.name", tool_name)
             if call_id:
                 span.set_attribute("gen_ai.tool.call.id", call_id)
-            if tool_name == "fetch_url":
-                result = await self._execute_fetch(tool_input, deadline)
-            elif tool_name == "search_web":
-                result = await self._execute_search(tool_input, deadline)
-            else:
+            try:
+                if tool_name == "fetch_url":
+                    result = await self._execute_fetch(tool_input, deadline)
+                elif tool_name == "search_web":
+                    result = await self._execute_search(tool_input, deadline)
+                else:
+                    result = ToolResult(
+                        content=f"Unknown tool: {tool_name}",
+                        is_error=True,
+                        error="unknown_tool",
+                        attempts=0,
+                    )
+            except RunTimeoutError:
+                raise
+            except Exception as e:
+                # A bug or an unclassified library error in one tool call
+                # should cost that call, not the whole run.
+                span.record_exception(e)
                 result = ToolResult(
-                    content=f"Unknown tool: {tool_name}",
+                    content=f"{tool_name} failed unexpectedly: {type(e).__name__}: {e}",
                     is_error=True,
-                    error="unknown_tool",
-                    attempts=0,
+                    attempts=1,
+                    error="internal_error",
                 )
             span.set_attribute("tool.attempts", result.attempts)
             span.set_attribute("tool.is_error", result.is_error)
@@ -347,6 +398,10 @@ class ToolExecutor:
         try:
             text = await self._call(lambda: self._fetch(url), deadline, attempts)
             return ToolResult(content=text, sources={url: text}, attempts=attempts.n)
+        except BlockedURLError as e:
+            return ToolResult(
+                content=str(e), is_error=True, attempts=attempts.n, error="blocked_url"
+            )
         except (ToolError, TimeoutError) as e:
             fetch_error = _describe(e)
 
