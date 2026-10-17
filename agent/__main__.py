@@ -13,6 +13,7 @@ import logging
 
 from agent.orchestrator import ResearchAgent
 from agent.telemetry import setup_tracing, shutdown_tracing
+from config import settings
 
 
 async def _main(job_url: str) -> int:
@@ -29,9 +30,11 @@ async def _main(job_url: str) -> int:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser = argparse.ArgumentParser(prog="python -m agent", description=__doc__.split("\n\n")[0])
     parser.add_argument("job_url")
     args = parser.parse_args()
+    if not settings.anthropic_api_key or not settings.tavily_api_key:
+        parser.error("set ANTHROPIC_API_KEY and TAVILY_API_KEY (see .env.example)")
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
     setup_tracing()
     try:
