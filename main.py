@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from agent.orchestrator import ResearchAgent, run_agent
 from agent.telemetry import setup_tracing, shutdown_tracing
@@ -39,6 +39,14 @@ async def health():
 
 class AgentRequest(BaseModel):
     job_url: str
+
+    @field_validator("job_url")
+    @classmethod
+    def _http_url(cls, v: str) -> str:
+        v = v.strip()
+        if not v.startswith(("http://", "https://")) or len(v) > 2048:
+            raise ValueError("job_url must be an http(s) URL")
+        return v
 
 
 @app.post("/agent/run")

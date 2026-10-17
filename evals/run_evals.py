@@ -158,6 +158,8 @@ def main():
     parser.add_argument("--judge", action="store_true", help="LLM-judge claim support (live only)")
     parser.add_argument("--write-md", action="store_true", help="regenerate evals/RESULTS.md")
     args = parser.parse_args()
+    if args.write_md and args.live_only:
+        parser.error("--write-md needs the mocked suite; use --live --write-md instead")
     # Retry and fallback warnings are expected in the mock suite; keep output readable.
     logging.basicConfig(level=logging.ERROR)
 

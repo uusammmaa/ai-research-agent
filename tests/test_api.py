@@ -17,6 +17,12 @@ def test_health(client):
     assert client.get("/health").json() == {"status": "ok"}
 
 
+@pytest.mark.parametrize("job_url", ["", "file:///etc/passwd", "not a url"])
+def test_run_rejects_non_http_urls(client, job_url):
+    response = client.post("/agent/run", json={"job_url": job_url})
+    assert response.status_code == 422
+
+
 def test_run_requires_api_keys(client, monkeypatch):
     monkeypatch.setattr(main.settings, "anthropic_api_key", "")
     response = client.post("/agent/run", json={"job_url": "https://example.com/job/123"})
