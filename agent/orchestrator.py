@@ -342,11 +342,18 @@ class ResearchAgent:
             )
 
         # Independent calls in one turn run concurrently; each gets its own
-        # execute_tool span under this step.
+        # execute_tool span under this step. execute() only raises when the
+        # run is out of time; wait for every call before re-raising so no
+        # sibling task is left running.
         with trace.use_span(step_span, end_on_exit=False):
-            results: list[ToolResult] = await asyncio.gather(
-                *(self.tools.execute(b.name, b.input, deadline, call_id=b.id) for b in tool_blocks)
+            outcomes = await asyncio.gather(
+                *(self.tools.execute(b.name, b.input, deadline, call_id=b.id) for b in tool_blocks),
+                return_exceptions=True,
             )
+        for outcome in outcomes:
+            if isinstance(outcome, BaseException):
+                raise outcome
+        results: list[ToolResult] = outcomes
 
         tool_results = []
         for block, result in zip(tool_blocks, results, strict=True):

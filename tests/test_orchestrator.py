@@ -4,6 +4,7 @@ import json
 import pytest
 
 from agent.orchestrator import ResearchAgent, run_agent
+from agent.reliability import RunTimeoutError
 from agent.tools import ToolExecutor, ToolResult
 from evals.fakes import (
     CANNED_TOOLS,
@@ -130,6 +131,35 @@ async def test_non_retryable_llm_error_ends_run_with_error():
     assert types(steps) == ["error", "run_summary"]
     assert "LLM call failed" in steps[0].message
     assert agent.state.status == "error"
+
+
+async def test_run_timeout_during_parallel_tools_leaves_no_orphan_tasks():
+    finished = []
+
+    class OneTimesOut(ToolExecutor):
+        async def execute(self, name, tool_input, deadline=None, call_id=None):
+            if tool_input["url"].endswith("/1"):
+                raise RunTimeoutError("out of time")
+            await asyncio.sleep(0.05)
+            finished.append(tool_input["url"])
+            return ToolResult(content="slow page")
+
+    agent, _ = make_agent(
+        [
+            tool_use_response(
+                [
+                    ("fetch_url", {"url": "https://a.example/1"}),
+                    ("fetch_url", {"url": "https://b.example/2"}),
+                ]
+            )
+        ],
+        {},
+    )
+    agent.tools = OneTimesOut()
+    steps = await collect(agent)
+    assert "timed out" in [s for s in steps if s.type == "error"][0].message
+    # The slower sibling ran to completion before the run reported the error.
+    assert finished == ["https://b.example/2"]
 
 
 async def test_span_tree_covers_every_step_tool_and_llm_call(spans):
