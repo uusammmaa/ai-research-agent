@@ -2,60 +2,80 @@
 Mocked orchestrator-logic eval suite.
 
 These cases never touch the network or the real Anthropic API. They script
-the sequence of Claude responses (via FakeResponse) and tool results, then
-assert the agentic loop in agent/orchestrator.py behaves correctly against
-each edge case called out in the project's own troubleshooting table:
-JSON parsing (clean / fenced / prose-wrapped / malformed / missing field),
-max_iterations enforcement, unexpected stop_reason, and tool-error recovery.
+the sequence of Claude responses and tool outcomes, then assert the agentic
+loop in agent/orchestrator.py behaves correctly: JSON parsing (clean / fenced
+/ prose-wrapped), validation with repair-on-failure, max_iterations and
+timeout guards, unexpected and refusal stop reasons, LLM and tool retries,
+the fallback model, and the fetch -> search fallback.
 """
+
 import asyncio
 import json
-from unittest.mock import patch
 
-from agent import orchestrator
+from agent.models import AgentStep
+from agent.tools import SearchHit, ToolError
 from evals.fakes import (
+    ABOUT_URL,
+    CANNED_TOOLS,
+    HANG,
+    JOB_PAGE,
+    JOB_URL,
+    SEARCH_HITS,
+    VALID_BRIEF,
     FakeResponse,
+    Seq,
+    by_model,
+    make_agent,
+    overloaded_error,
+    refusal_response,
+    research_turns,
     text_response,
     tool_use_response,
-    make_create_stub,
-    make_execute_tool_stub,
-    VALID_BRIEF,
 )
+from evals.grounding import grounding_report
 from evals.scoring import is_valid_research_brief
 
 
-async def _collect_steps(job_url: str) -> list[dict]:
-    steps = []
-    async for line in orchestrator.run_agent(job_url):
-        steps.append(json.loads(line))
-    return steps
+async def _collect(agent, job_url: str) -> list[dict]:
+    steps: list[AgentStep] = []
+    async for step in agent.run(job_url):
+        steps.append(step)
+    return [json.loads(s.model_dump_json(exclude_none=True)) for s in steps]
 
 
-def _run_case(responses, tool_results, job_url="https://example.com/job/123", max_iterations=None):
-    create_stub = make_create_stub(responses)
-    execute_stub = make_execute_tool_stub(tool_results)
-
-    patches = [
-        patch.object(orchestrator.client.messages, "create", side_effect=create_stub),
-        patch.object(orchestrator, "execute_tool", side_effect=execute_stub),
-    ]
-    if max_iterations is not None:
-        patches.append(patch.object(orchestrator.settings, "max_iterations", max_iterations))
-
-    for p in patches:
-        p.start()
-    try:
-        return asyncio.run(_collect_steps(job_url))
-    finally:
-        for p in reversed(patches):
-            p.stop()
+def _run_case(script, canned_tools, job_url=JOB_URL, **kwargs):
+    agent, fake = make_agent(script, canned_tools, **kwargs)
+    steps = asyncio.run(_collect(agent, job_url))
+    return steps, agent.state, fake
 
 
 def _find(steps, type_):
     return [s for s in steps if s["type"] == type_]
 
 
-def _score_success_case(steps: dict, name: str) -> dict:
+def _outcomes(steps) -> list[str]:
+    """Step types other than the trailing run_summary."""
+    return [s["type"] for s in steps if s["type"] != "run_summary"]
+
+
+def _run_metrics(state) -> dict:
+    return {
+        "llm_calls": state.llm_calls,
+        "llm_attempts": state.llm_attempts,
+        "tool_calls": state.tool_calls,
+        "tool_attempts": state.tool_attempts,
+        "repairs": state.repairs,
+        "models_used": state.models_used,
+        "input_tokens": state.usage.input_tokens,
+        "output_tokens": state.usage.output_tokens,
+        "cost_usd": round(state.usage.cost_usd, 6),
+        "cost_by_model": {m: round(u.cost_usd, 6) for m, u in state.usage.by_model.items()},
+    }
+
+
+def _score_success_case(
+    steps, state, name: str, extra_checks: dict | None = None, expect_grounded: bool = True
+) -> dict:
     checks = {}
     complete_steps = _find(steps, "complete")
     error_steps = _find(steps, "error")
@@ -63,6 +83,7 @@ def _score_success_case(steps: dict, name: str) -> dict:
     checks["completed"] = len(complete_steps) == 1 and len(error_steps) == 0
 
     valid_schema = False
+    brief = None
     if complete_steps:
         try:
             brief = json.loads(complete_steps[0]["output"])
@@ -71,126 +92,351 @@ def _score_success_case(steps: dict, name: str) -> dict:
             valid_schema = False
     checks["valid_schema"] = valid_schema
 
+    grounding = grounding_report(brief, state.corpus) if brief else None
+    checks["claims_cite_retrieved_sources"] = (
+        bool(grounding) and grounding["citation_accuracy"] == 1.0
+    )
+    if expect_grounded:
+        checks["claims_grounded"] = bool(grounding) and grounding["groundedness"] == 1.0
+
     tool_calls = _find(steps, "tool_call")
     checks["first_tool_is_fetch_url"] = (
-        bool(tool_calls) and tool_calls[0]["tool"] == "fetch_url"
-    ) if tool_calls else True  # no tools called is not a grounding violation by itself
+        (bool(tool_calls) and tool_calls[0]["tool"] == "fetch_url") if tool_calls else True
+    )  # no tools called is not a grounding violation by itself
+    checks.update(extra_checks or {})
 
     passed = all(checks.values())
-    return {"name": name, "expected": "complete", "passed": passed, "checks": checks, "steps": len(steps)}
+    return {
+        "name": name,
+        "expected": "complete",
+        "passed": passed,
+        "checks": checks,
+        "steps": len(steps),
+        "grounding": grounding,
+        **_run_metrics(state),
+    }
 
 
-def _score_error_case(steps, name: str, message_substring: str) -> dict:
+def _score_error_case(
+    steps, state, name: str, message_substring: str, extra_checks: dict | None = None
+) -> dict:
     error_steps = _find(steps, "error")
     checks = {
         "errored": len(error_steps) == 1,
-        "message_matches": bool(error_steps) and message_substring.lower() in error_steps[0]["message"].lower(),
+        "message_matches": bool(error_steps)
+        and message_substring.lower() in error_steps[0]["message"].lower(),
+        "error_is_final_outcome": _outcomes(steps)[-1:] == ["error"],
     }
+    checks.update(extra_checks or {})
     passed = all(checks.values())
-    return {"name": name, "expected": "error", "passed": passed, "checks": checks, "steps": len(steps)}
+    return {
+        "name": name,
+        "expected": "error",
+        "passed": passed,
+        "checks": checks,
+        "steps": len(steps),
+        **_run_metrics(state),
+    }
+
+
+# ─── Parsing ─────────────────────────────────────────────────────────────────
 
 
 def case_happy_path():
-    responses = [
-        tool_use_response([("fetch_url", {"url": "https://example.com/job/123"})]),
-        tool_use_response([("search_web", {"query": "Acme Corp company overview funding"})]),
-        tool_use_response([("search_web", {"query": "Acme Corp news 2025"})]),
-        text_response(json.dumps(VALID_BRIEF)),
-    ]
-    tool_results = {
-        "fetch_url": "Senior Backend Engineer at Acme Corp. Remote. Python, FastAPI, PostgreSQL required.",
-        "search_web": "Title: Acme Corp Overview\nURL: https://acme.com/about\nContent: Series B fintech, founded 2019.",
-    }
-    steps = _run_case(responses, tool_results)
-    return _score_success_case(steps, "happy_path_clean_json")
+    script = [*research_turns(), text_response(json.dumps(VALID_BRIEF))]
+    steps, state, _ = _run_case(script, CANNED_TOOLS)
+    return _score_success_case(steps, state, "happy_path_clean_json")
 
 
 def case_json_in_markdown_fence():
     fenced = "```json\n" + json.dumps(VALID_BRIEF) + "\n```"
-    responses = [
-        tool_use_response([("fetch_url", {"url": "https://example.com/job/123"})]),
-        text_response(fenced),
-    ]
-    tool_results = {"fetch_url": "Senior Backend Engineer at Acme Corp."}
-    steps = _run_case(responses, tool_results)
-    return _score_success_case(steps, "json_wrapped_in_markdown_fence")
+    steps, state, _ = _run_case([*research_turns(), text_response(fenced)], CANNED_TOOLS)
+    return _score_success_case(steps, state, "json_wrapped_in_markdown_fence")
 
 
 def case_json_with_preamble_text():
-    prose = "Here is the research brief you requested:\n\n" + json.dumps(VALID_BRIEF) + "\n\nLet me know if you need anything else!"
-    responses = [
-        tool_use_response([("fetch_url", {"url": "https://example.com/job/123"})]),
-        text_response(prose),
-    ]
-    tool_results = {"fetch_url": "Senior Backend Engineer at Acme Corp."}
-    steps = _run_case(responses, tool_results)
-    return _score_success_case(steps, "json_with_prose_preamble")
+    prose = (
+        "Here is the research brief you requested:\n\n"
+        + json.dumps(VALID_BRIEF)
+        + "\n\nLet me know if you need anything else!"
+    )
+    steps, state, _ = _run_case([*research_turns(), text_response(prose)], CANNED_TOOLS)
+    return _score_success_case(steps, state, "json_with_prose_preamble")
 
 
-def case_malformed_unparseable():
-    responses = [
-        tool_use_response([("fetch_url", {"url": "https://example.com/job/123"})]),
+# ─── Validation and repair ───────────────────────────────────────────────────
+
+
+def case_malformed_repair_exhausted():
+    # Claude never produces JSON: two repair attempts, then a clean error.
+    script = [
+        *research_turns(),
         text_response("I looked into it but couldn't find enough information to produce a brief."),
     ]
-    tool_results = {"fetch_url": "Senior Backend Engineer at Acme Corp."}
-    steps = _run_case(responses, tool_results)
-    return _score_error_case(steps, "malformed_no_json", "failed to parse")
+    steps, state, _ = _run_case(script, CANNED_TOOLS)
+    return _score_error_case(
+        steps,
+        state,
+        "malformed_no_json_repair_exhausted",
+        "failed to parse",
+        {"two_repairs_attempted": len(_find(steps, "repair")) == 2},
+    )
 
 
-def case_missing_required_field():
+def case_missing_field_repaired():
     incomplete = {k: v for k, v in VALID_BRIEF.items() if k != "sources"}
-    responses = [
-        tool_use_response([("fetch_url", {"url": "https://example.com/job/123"})]),
+    script = [
+        *research_turns(),
         text_response(json.dumps(incomplete)),
+        text_response(json.dumps(VALID_BRIEF)),
     ]
-    tool_results = {"fetch_url": "Senior Backend Engineer at Acme Corp."}
-    steps = _run_case(responses, tool_results)
-    return _score_error_case(steps, "missing_required_field", "failed to parse")
+    steps, state, fake = _run_case(script, CANNED_TOOLS)
+    repair_prompt = fake.messages.requests[-1]["messages"][-1]["content"]
+    return _score_success_case(
+        steps,
+        state,
+        "missing_field_repaired",
+        {
+            "one_repair": state.repairs == 1,
+            "repair_prompt_names_field": "sources" in repair_prompt,
+        },
+    )
+
+
+def case_unretrieved_citation_repaired():
+    # The first brief cites a page no tool call returned; the grounding guard
+    # rejects it and the repaired brief drops the claim.
+    hallucinated = json.loads(json.dumps(VALID_BRIEF))
+    hallucinated["sources"].append("https://made-up.example/press")
+    hallucinated["claims"].append(
+        {
+            "statement": "Example Co is profitable.",
+            "source": "https://made-up.example/press",
+            "quote": "Example Co is profitable",
+        }
+    )
+    script = [
+        *research_turns(),
+        text_response(json.dumps(hallucinated)),
+        text_response(json.dumps(VALID_BRIEF)),
+    ]
+    steps, state, _ = _run_case(script, CANNED_TOOLS)
+    repair_steps = _find(steps, "repair")
+    return _score_success_case(
+        steps,
+        state,
+        "unretrieved_citation_repaired",
+        {
+            "guard_flagged_url": bool(repair_steps)
+            and "made-up.example" in repair_steps[0]["output"],
+        },
+    )
+
+
+# ─── Loop guards ─────────────────────────────────────────────────────────────
 
 
 def case_max_iterations_exceeded():
-    # Claude never stops asking for tools. With max_iterations patched to 3,
-    # the loop must yield exactly one error step citing the limit.
-    responses = [
-        tool_use_response([("search_web", {"query": f"probe {i}"})]) for i in range(10)
-    ]
-    tool_results = {"search_web": "No results found."}
-    steps = _run_case(responses, tool_results, max_iterations=3)
-    return _score_error_case(steps, "max_iterations_exceeded", "max iterations")
+    # Claude never stops asking for tools. With max_iterations=3 the loop
+    # must yield exactly one error step citing the limit.
+    script = [tool_use_response([("search_web", {"query": f"probe {i}"})]) for i in range(10)]
+    steps, state, _ = _run_case(script, {"search_web": []}, max_iterations=3)
+    return _score_error_case(
+        steps,
+        state,
+        "max_iterations_exceeded",
+        "max iterations",
+        {"three_llm_calls": state.llm_calls == 3},
+    )
+
+
+def case_run_timeout():
+    # The second LLM call hangs past the run budget. The deadline caps the
+    # per-call timeout, so the run ends instead of retrying forever.
+    script = [tool_use_response([("fetch_url", {"url": JOB_URL})]), HANG]
+    steps, state, _ = _run_case(script, CANNED_TOOLS, run_timeout_seconds=0.3, llm_timeout=10)
+    return _score_error_case(steps, state, "run_timeout", "timed out")
 
 
 def case_unexpected_stop_reason():
-    responses = [FakeResponse(stop_reason="max_tokens", content=[])]
-    steps = _run_case(responses, {})
-    return _score_error_case(steps, "unexpected_stop_reason", "unexpected stop reason")
+    steps, state, _ = _run_case([FakeResponse(stop_reason="max_tokens", content=[])], {})
+    return _score_error_case(steps, state, "unexpected_stop_reason", "unexpected stop reason")
+
+
+def case_refusal():
+    steps, state, _ = _run_case([refusal_response("cyber")], {})
+    return _score_error_case(steps, state, "refusal_stop_reason", "declined")
+
+
+# ─── LLM retries and fallback ────────────────────────────────────────────────
+
+
+def case_llm_transient_error_retried():
+    # One 529 Overloaded, then the same request succeeds.
+    script = [overloaded_error(), *research_turns(), text_response(json.dumps(VALID_BRIEF))]
+    steps, state, _ = _run_case(script, CANNED_TOOLS)
+    return _score_success_case(
+        steps,
+        state,
+        "llm_transient_error_retried",
+        {
+            "one_retry": state.llm_attempts == state.llm_calls + 1,
+            "stayed_on_primary": state.models_used == ["claude-opus-5-5"],
+        },
+    )
+
+
+def case_llm_fallback_model():
+    # The primary model is overloaded for the whole run; after its retries
+    # are spent the run continues on the fallback model.
+    turns = iter([*research_turns(), text_response(json.dumps(VALID_BRIEF))])
+    script = [
+        by_model(
+            {
+                "claude-opus-5-5": overloaded_error,
+                "claude-sonnet-5-5": lambda: next(turns),
+            }
+        )
+    ]
+    steps, state, _ = _run_case(script, CANNED_TOOLS)
+    return _score_success_case(
+        steps,
+        state,
+        "llm_fallback_model",
+        {
+            "fell_back": state.fell_back,
+            "finished_on_fallback": state.models_used == ["claude-sonnet-5-5"],
+        },
+    )
+
+
+# ─── Tool retries and fallback ───────────────────────────────────────────────
+
+
+def case_tool_transient_error_retried():
+    canned = {
+        "fetch_url": Seq(ToolError("HTTP error 503", retryable=True, status_code=503), JOB_PAGE),
+        "search_web": SEARCH_HITS,
+    }
+    script = [*research_turns(), text_response(json.dumps(VALID_BRIEF))]
+    steps, state, _ = _run_case(script, canned)
+    return _score_success_case(
+        steps,
+        state,
+        "tool_transient_error_retried",
+        {"fetch_retried_once": state.tool_attempts == state.tool_calls + 1},
+    )
 
 
 def case_tool_error_recovery():
-    # fetch_url "fails" (as the real tool does: returns an error string rather
-    # than raising), Claude recovers per the system prompt's fallback rule and
-    # searches instead, then completes successfully.
-    responses = [
-        tool_use_response([("fetch_url", {"url": "https://example.com/job/123"})]),
-        tool_use_response([("search_web", {"query": "site:example.com job/123 posting"})]),
-        text_response(json.dumps(VALID_BRIEF)),
-    ]
-    tool_results = {
-        "fetch_url": "Error fetching https://example.com/job/123: 403 Forbidden",
-        "search_web": "Title: Acme Corp Senior Backend Engineer\nURL: https://example.com/job/123\nContent: role details...",
+    # fetch_url is blocked (403, not retryable). The tool layer falls back to
+    # searching for the URL, and Claude completes from the search results.
+    # The posting was never fetched, so the brief may only cite JOB_URL
+    # because the fallback search returned it.
+    job_hit = SearchHit("Example Co Senior Backend Engineer", JOB_URL, JOB_PAGE)
+    canned = {
+        "fetch_url": ToolError("HTTP error 403 fetching", retryable=False, status_code=403),
+        "search_web": [job_hit, *SEARCH_HITS],
     }
-    steps = _run_case(responses, tool_results)
-    return _score_success_case(steps, "tool_error_recovery")
+    script = [*research_turns(), text_response(json.dumps(VALID_BRIEF))]
+    steps, state, _ = _run_case(script, canned)
+    results = _find(steps, "tool_result")
+    return _score_success_case(
+        steps,
+        state,
+        "tool_error_recovery_fetch_falls_back_to_search",
+        {"fallback_reported": bool(results) and "fell back to search_web" in results[0]["message"]},
+    )
+
+
+def case_tool_timeout_is_error_result():
+    # Every fetch and the fallback search hang: the tool result comes back
+    # as an error (not an exception) and Claude can still answer.
+    canned = {"fetch_url": HANG, "search_web": HANG}
+    script = [
+        tool_use_response([("fetch_url", {"url": JOB_URL})]),
+        text_response("No data available."),
+    ]
+    steps, state, fake = _run_case(script, canned, tool_timeout=0.05, max_repair_attempts=0)
+    tool_result_block = fake.messages.requests[1]["messages"][-1]["content"][0]
+    return _score_error_case(
+        steps,
+        state,
+        "tool_timeout_returns_error_result",
+        "failed to parse",
+        {"tool_result_is_error": tool_result_block.get("is_error") is True},
+    )
+
+
+# ─── Groundedness and citation accuracy ──────────────────────────────────────
+# The agent's guard only rejects citations to pages it never retrieved.
+# Whether the retrieved page supports the claim is the eval's job, so these
+# cases complete and the scorer has to catch the problem. They check the
+# metric, not just the agent.
+
+
+def _brief_with(claim_index: int, **changes) -> dict:
+    brief = json.loads(json.dumps(VALID_BRIEF))
+    brief["claims"][claim_index].update(changes)
+    return brief
+
+
+def _grounding_case(name: str, brief: dict, expect_reason: str):
+    script = [*research_turns(), text_response(json.dumps(brief))]
+    steps, state, _ = _run_case(script, CANNED_TOOLS)
+    result = _score_success_case(steps, state, name, expect_grounded=False)
+    grounding = result["grounding"] or {}
+    unsupported = grounding.get("unsupported", [])
+    result["checks"]["scorer_flags_exactly_one_claim"] = len(unsupported) == 1
+    result["checks"]["scorer_gives_right_reason"] = (
+        bool(unsupported) and expect_reason in unsupported[0]["reason"]
+    )
+    result["expected"] = "complete, 1 claim flagged"
+    result["passed"] = all(result["checks"].values())
+    return result
+
+
+def case_fabricated_quote_flagged():
+    # Real source, invented quote and fact.
+    brief = _brief_with(
+        1,
+        statement="Example Co was founded in 2021.",
+        quote="Example Co was founded in 2021",
+    )
+    return _grounding_case("fabricated_quote_flagged", brief, "quote not in cited source")
+
+
+def case_misattributed_source_flagged():
+    # The quote is real but lives on a different page than the one cited.
+    brief = _brief_with(3, source=ABOUT_URL)
+    return _grounding_case("misattributed_source_flagged", brief, "quote not in cited source")
+
+
+def case_changed_number_flagged():
+    # The quote is right, the statement inflates the number.
+    brief = _brief_with(3, statement="Example Co raised a $50M Series B in 2025.")
+    return _grounding_case("changed_number_flagged", brief, "numbers not in source")
 
 
 ALL_CASES = [
     case_happy_path,
     case_json_in_markdown_fence,
     case_json_with_preamble_text,
-    case_malformed_unparseable,
-    case_missing_required_field,
+    case_malformed_repair_exhausted,
+    case_missing_field_repaired,
+    case_unretrieved_citation_repaired,
     case_max_iterations_exceeded,
+    case_run_timeout,
     case_unexpected_stop_reason,
+    case_refusal,
+    case_llm_transient_error_retried,
+    case_llm_fallback_model,
+    case_tool_transient_error_retried,
     case_tool_error_recovery,
+    case_tool_timeout_is_error_result,
+    case_fabricated_quote_flagged,
+    case_misattributed_source_flagged,
+    case_changed_number_flagged,
 ]
 
 
@@ -200,5 +446,13 @@ def run_all() -> list[dict]:
         try:
             results.append(case_fn())
         except Exception as e:
-            results.append({"name": case_fn.__name__, "expected": "?", "passed": False, "checks": {"exception": str(e)}, "steps": 0})
+            results.append(
+                {
+                    "name": case_fn.__name__,
+                    "expected": "?",
+                    "passed": False,
+                    "checks": {"exception": f"{type(e).__name__}: {e}"},
+                    "steps": 0,
+                }
+            )
     return results

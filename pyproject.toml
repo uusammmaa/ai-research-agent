@@ -1,0 +1,27 @@
+[project]
+name = "ai-research-agent"
+version = "0.2.0"
+description = "Tool-using research agent that turns a job posting URL into a cited research brief."
+requires-python = ">=3.11"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+# Long prompt strings and URLs read better unwrapped; the formatter handles code.
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["agent", "evals", "config", "main"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+filterwarnings = [
+    # fastapi's TestClient still imports httpx; harmless for these tests.
+    "ignore::DeprecationWarning:fastapi.testclient",
+    "ignore:Using `httpx` with `starlette.testclient`",
+]
